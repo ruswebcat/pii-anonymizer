@@ -1,10 +1,10 @@
 # FILE: src/client_identity.py
-# VERSION: 1.0.0
+# VERSION: 1.1.0
 # START_MODULE_CONTRACT
-#   PURPOSE: Опознать клиента запроса (имя доверенного канала) по трём источникам по порядку — явный заголовок, отпечаток ключа доступа, шаблон User-Agent — и честно признать, когда не опознан ни один.
-#   SCOPE: разбор раздела настроек trusted_clients (список записей, компактная строка, JSON), отпечаток ключа без хранения самого ключа, сопоставление шаблонов User-Agent, порядок источников и запрет на понижение надёжности, описание набора для healthz без значений.
+#   PURPOSE: Опознать клиента запроса (имя доверенного канала) по трём источникам по порядку — явный заголовок, отпечаток ключа доступа, шаблон User-Agent — и честно признать, когда не опознан ни один; дать оператору прибор, который показывает то же решение по фактическим заголовкам.
+#   SCOPE: разбор раздела настроек trusted_clients (список записей, компактная строка, JSON), отпечаток ключа без хранения самого ключа, сопоставление шаблонов User-Agent, порядок источников и запрет на понижение надёжности, описание набора для healthz без значений, прибор «проверить строку» (заголовки → канал, источник, шаблон и что было бы при unknown_client).
 #   DEPENDS: M-CHANNEL-POLICY
-#   LINKS: M-CLIENT-IDENTITY, M-CONFIG, M-CHANNEL-POLICY, V-M-CHANNEL-POLICY, fn-identify_client, fn-parse_trusted_clients, fn-fingerprint
+#   LINKS: M-CLIENT-IDENTITY, M-CONFIG, M-CHANNEL-POLICY, V-M-CHANNEL-POLICY, fn-identify_client, fn-parse_trusted_clients, fn-fingerprint, fn-check_report
 #   ROLE: RUNTIME
 #   MAP_MODE: EXPORTS
 # END_MODULE_CONTRACT
@@ -22,12 +22,20 @@
 #   fn-fingerprint - необратимый отпечаток ключа доступа
 #   fn-normalize_channel - имя канала в каноническом виде
 #   fn-parse_trusted_clients - разобрать раздел настроек
+#   fn-match_user_agent - шаблон, который совпал с заголовком, вместе с записью
 #   fn-identify_client - опознать клиента запроса
-#   fn-main - печать отпечатка ключа для настроек
+#   fn-parse_header_lines - прочитать заголовки запроса из строк «Имя: значение»
+#   fn-load_clients - собрать таблицу опознания из аргументов прибора
+#   fn-read_config_overlay - прочитать файл настроек службы для прибора
+#   fn-versioned_patterns - шаблоны с номером версии в записи (предупреждение прибора)
+#   fn-check_report - итог проверки: канал, источник и что было бы при unknown_client
+#   fn-format_check - человеческий отчёт прибора
+#   fn-main - печать отпечатка ключа для настроек и прибор «проверить строку»
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.0.0 - решение владельца 26.09.2026: сторонние ИИ-приложения (Cursor, Claude Code, Codex и прочие) не шлют меток Hermes, поэтому канал опознаётся по явному заголовку, по отпечатку ключа доступа и по шаблону User-Agent; неопознанный клиент получает решение настройки «поведение для неизвестного клиента».
+#   LAST_CHANGE: v1.1.0 - прибор «проверить строку»: по фактическим заголовкам (User-Agent или готовый набор) показывает канал, источник, совпавший шаблон и решение, которое получил бы клиент, не назвавший себя ничем. Шаблоны в примерах настроек — без номеров версий: строка приложения меняется при каждом обновлении, а номер в шаблоне ломает опознание молча.
+#   PREVIOUS: v1.0.0 - решение владельца 26.09.2026: сторонние ИИ-приложения (Cursor, Claude Code, Codex и прочие) не шлют меток Hermes, поэтому канал опознаётся по явному заголовку, по отпечатку ключа доступа и по шаблону User-Agent; неопознанный клиент получает решение настройки «поведение для неизвестного клиента».
 # END_CHANGE_SUMMARY
 
 """Опознание клиента запроса.
@@ -56,16 +64,26 @@ User-Agent: предъявленный и не совпавший ключ эт�
 
 from __future__ import annotations
 
+import argparse
 import fnmatch
 import hashlib
 import hmac
 import json
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from src.channel_policy import BLOCKED_CHANNELS
+from src.channel_policy import (
+    BLOCKED_CHANNELS,
+    CHANNEL_ALL,
+    DECISION_DETOKENIZE,
+    DECISION_KEEP,
+    UNKNOWN_CLIENT_MODES,
+    UNKNOWN_KEEP_CODES,
+    ChannelPolicy,
+    ChannelPolicyError,
+)
 
 LOGGER_NAME = "ClientIdentity"
 LOG_MARKER = "[ClientIdentity][identify_client][BLOCK_IDENTIFY_CLIENT]"
@@ -302,12 +320,16 @@ class TrustedClients:
                 return record
         return None
 
-    def by_user_agent(self, user_agent: str | None) -> TrustedClient | None:
-        """Return the client whose User-Agent pattern matches this header.
+    def match_user_agent(self, user_agent: str | None) -> tuple[TrustedClient, str] | None:
+        """Return the record and the pattern that matched this User-Agent.
 
-        Шаблоны сопоставляются без учёта регистра и покрывают заголовок целиком
-        (``fnmatch``): ``*cursor*`` поймает «vscode/1.9 … Cursor/0.4x», ``cursor/*`` — только
-        строку, начинающуюся с «cursor/». Порядок записей в настройках и есть порядок приоритета.
+        # START_CONTRACT: match_user_agent
+        #   PURPOSE: Отделить «чей это клиент» от «какой шаблон совпал» — прибору нужно и то и другое.
+        #   INPUTS: { user_agent: str | None - заголовок User-Agent }
+        #   OUTPUTS: { tuple[TrustedClient, str] | None - запись и совпавший шаблон либо None }
+        #   SIDE_EFFECTS: none
+        #   LINKS: M-CLIENT-IDENTITY, V-M-CHANNEL-POLICY
+        # END_CONTRACT: match_user_agent
         """
         text = str(user_agent or "").strip().lower()
         if not text:
@@ -315,8 +337,18 @@ class TrustedClients:
         for record in self.records:
             for pattern in record.user_agent_patterns:
                 if fnmatch.fnmatch(text, pattern.strip().lower()):
-                    return record
+                    return record, pattern
         return None
+
+    def by_user_agent(self, user_agent: str | None) -> TrustedClient | None:
+        """Return the client whose User-Agent pattern matches this header.
+
+        Шаблоны сопоставляются без учёта регистра и покрывают заголовок целиком
+        (``fnmatch``): ``*cursor*`` поймает «vscode/1.9 … Cursor/0.4x», ``cursor/*`` — только
+        строку, начинающуюся с «cursor/». Порядок записей в настройках и есть порядок приоритета.
+        """
+        matched = self.match_user_agent(user_agent)
+        return matched[0] if matched else None
 
     def describe(self) -> dict[str, object]:
         """Return the table for healthz: каналы и способы, без пояснений и без значений.
@@ -616,26 +648,458 @@ def declared_identity(channel: str | None) -> ClientIdentity:
 # END_BLOCK_IDENTIFY_CLIENT
 
 
+# START_BLOCK_CHECK_CLI
+#: Команды модуля: отпечаток ключа доступа и прибор «проверить строку».
+KEY_COMMAND = "key"
+CHECK_COMMAND = "check"
+
+#: Шаблон с цифрой почти наверняка несёт номер версии клиента: строка приложения меняется при
+#: каждом обновлении, и такой шаблон перестаёт совпадать молча. Прибор называет их отдельно —
+#: это подсказка оператору, а не отказ: решение о шаблоне принимает владелец настроек.
+_VERSION_IN_PATTERN = re.compile(r"\d")
+
+CHECK_USAGE = """usage:
+  python3 -m src.client_identity <ключ>                 отпечаток ключа для настроек
+  python3 -m src.client_identity key <ключ>             то же, явной командой
+  python3 -m src.client_identity check [опции] [строка User-Agent]
+
+check — прибор «проверить строку»: показывает, каким каналом и каким источником опознан клиент,
+и что было бы, если бы он не назвался ничем (настройка unknown_client).
+
+  python3 -m src.client_identity check "Cursor/1.0"
+  python3 -m src.client_identity check --header "X-PII-Channel: cursor"
+  python3 -m src.client_identity check --user-agent "claude-cli/2.1.2 (external, cli)" \\
+      --trusted-clients "claude-code=ua:*claude-cli*;codex=ua:*codex*"
+  python3 -m src.client_identity check --headers-file headers.txt --config /etc/pii-proxy/config.yaml
+
+опции check:
+  --user-agent, -a СТРОКА   фактическая строка User-Agent (её снимает tools/ua_probe.py)
+  --header "Имя: значение"  готовый заголовок запроса; повторяется для нескольких
+  --headers-file ФАЙЛ       тот же набор заголовков строками «Имя: значение» («-» — со входа)
+  --trusted-clients СТРОКА  таблица настроек: компактная строка или JSON
+  --config ФАЙЛ             файл настроек службы (берёт trusted_clients, unknown_client, каналы)
+  --unknown-client РЕЖИМ    keep_codes (умолчание) или restore
+  --detok-channels СПИСОК   каналы восстановления через запятую; «*» или пусто — любой канал
+  --declared КАНАЛ          канал, объявленный меткой доставки внутри запроса
+  --json                    тот же отчёт машинным видом
+"""
+
+
+def parse_header_lines(lines: Iterable[str]) -> dict[str, str]:
+    """Прочитать заголовки запроса из строк «Имя: значение».
+
+    # START_CONTRACT: parse_header_lines
+    #   PURPOSE: Принять заголовки в том виде, в котором их печатает заглушечный сервер или снимает оператор.
+    #   INPUTS: { lines: Iterable[str] - строки вида «User-Agent: Cursor/1.0» }
+    #   OUTPUTS: { dict[str, str] - заголовки в исходном написании имён }
+    #   SIDE_EFFECTS: none
+    #   LINKS: M-CLIENT-IDENTITY, tools/ua_probe.py, docs/OPERATIONS.md
+    # END_CONTRACT: parse_header_lines
+
+    Пустые строки и строки, начинающиеся с «#», пропускаются: файл со снятыми заголовками
+    оператор правит руками, и пояснения в нём не должны попадать в разбор.
+    """
+    headers: dict[str, str] = {}
+    for line in lines:
+        text = str(line).rstrip("\n").strip()
+        if not text or text.startswith("#"):
+            continue
+        name, separator, value = text.partition(":")
+        if not separator or not name.strip():
+            raise ClientIdentityError(
+                "CLIENT_IDENTITY_BAD_HEADER",
+                f"header line {text!r} must look like 'Name: value'",
+            )
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def load_clients(
+    raw_clients: object = None, config_path: str | None = None
+) -> tuple[TrustedClients, str]:
+    """Собрать таблицу опознания для прибора из аргумента или файла настроек.
+
+    # START_CONTRACT: load_clients
+    #   PURPOSE: Дать прибору ту же таблицу, что у службы, и честно сказать, откуда она взята.
+    #   INPUTS: { raw_clients: object - компактная строка или JSON-перечень, config_path: str | None - путь к файлу настроек }
+    #   OUTPUTS: { (TrustedClients, str) - таблица и пояснение, откуда она }
+    #   SIDE_EFFECTS: читает файл настроек, если он задан
+    #   LINKS: M-CLIENT-IDENTITY, M-CONFIG, docs/OPERATIONS.md
+    # END_CONTRACT: load_clients
+
+    Файл настроек читается тем же кодом, что и у службы (``src.config.read_overlay``), поэтому
+    прибор не расходится со службой в разборе раздела. Импорт ленивый: ``src.config`` сам
+    пользуется этим модулем, и зависимость на уровне файла была бы кольцевой.
+    """
+    if raw_clients:
+        return parse_trusted_clients(raw_clients), "из аргумента --trusted-clients"
+    if config_path:
+        overlay = read_config_overlay(config_path)
+        return (
+            parse_trusted_clients(overlay.get("trusted_clients")),
+            f"из файла настроек {config_path}",
+        )
+    return TrustedClients(), "пустая: ни раздел настроек, ни файл не заданы"
+
+
+def read_config_overlay(config_path: str) -> dict:
+    """Прочитать файл настроек службы для прибора, объяснив отказ словами.
+
+    # START_CONTRACT: read_config_overlay
+    #   PURPOSE: Дать прибору те же настройки, что у службы, и не пугать оператора трассой при неправильном пути.
+    #   INPUTS: { config_path: str - путь к файлу настроек }
+    #   OUTPUTS: { dict - разобранный файл настроек }
+    #   SIDE_EFFECTS: читает файл
+    #   LINKS: M-CLIENT-IDENTITY, M-CONFIG
+    # END_CONTRACT: read_config_overlay
+    """
+    from src.config import ConfigError, read_overlay
+
+    try:
+        return read_overlay(config_path)
+    except ConfigError as exc:
+        raise ClientIdentityError(
+            "CLIENT_IDENTITY_CONFIG_UNREADABLE", f"{config_path}: {exc.message}"
+        ) from exc
+
+
+def versioned_patterns(clients: TrustedClients) -> list[str]:
+    """Вернуть шаблоны User-Agent, в которых есть цифры: обычно это номер версии клиента.
+
+    # START_CONTRACT: versioned_patterns
+    #   PURPOSE: Назвать оператору шаблон, который сломается при обновлении клиента.
+    #   INPUTS: { clients: TrustedClients - таблица настроек }
+    #   OUTPUTS: { list[str] - шаблоны с цифрой }
+    #   SIDE_EFFECTS: none
+    #   LINKS: M-CLIENT-IDENTITY, docs/OPERATIONS.md
+    # END_CONTRACT: versioned_patterns
+    """
+    found: list[str] = []
+    for record in clients:
+        for pattern in record.user_agent_patterns:
+            if _VERSION_IN_PATTERN.search(pattern) and pattern not in found:
+                found.append(pattern)
+    return found
+
+
+def _policy_for(
+    unknown_client: str, detok_channels: Iterable[str] | None
+) -> tuple[ChannelPolicy | None, str]:
+    """Собрать политику каналов для прибора и коротко описать список каналов."""
+    allowed = frozenset(str(item).strip().lower() for item in detok_channels or () if str(item).strip())
+    if not allowed:
+        allowed = frozenset({CHANNEL_ALL})
+    description = (
+        "любой канал (умолчание публичной сборки)"
+        if CHANNEL_ALL in allowed
+        else ", ".join(sorted(allowed)) + " (список сужен)"
+    )
+    try:
+        return ChannelPolicy(allowed, unknown_client=unknown_client), description
+    except ChannelPolicyError:
+        return None, description
+
+
+def check_report(
+    headers: Mapping[str, str] | None,
+    clients: TrustedClients,
+    clients_source: str = "",
+    unknown_client: str = UNKNOWN_KEEP_CODES,
+    detok_channels: Iterable[str] | None = None,
+    declared: str | None = None,
+) -> dict[str, object]:
+    """Показать, чем опознан клиент и что было бы, если бы он не назвался ничем.
+
+    # START_CONTRACT: check_report
+    #   PURPOSE: Снять основную боль настройки: увидеть решение опознания до правки службы.
+    #   INPUTS: { headers: Mapping[str, str] | None - заголовки запроса, clients: TrustedClients - таблица настроек, clients_source: str - откуда таблица, unknown_client: str - режим для неопознанного клиента, detok_channels: Iterable[str] | None - каналы восстановления, declared: str | None - канал из метки доставки }
+    #   OUTPUTS: { dict[str, object] - канал, источник, совпавшая строка, решение и предупреждения }
+    #   SIDE_EFFECTS: none
+    #   LINKS: M-CLIENT-IDENTITY, M-CHANNEL-POLICY, docs/OPERATIONS.md
+    # END_CONTRACT: check_report
+
+    Ни одного значения клиента в отчёте нет по построению: ``identify_client`` возвращает
+    имя канала, источник и короткую метку, а отпечаток ключа печатается усечённым.
+    """
+    if unknown_client not in UNKNOWN_CLIENT_MODES:
+        raise ClientIdentityError(
+            "CLIENT_IDENTITY_BAD_OPTION",
+            f"unknown_client must be one of {sorted(UNKNOWN_CLIENT_MODES)}, got {unknown_client!r}",
+        )
+    identity = identify_client(headers, clients, declared=declared)
+    user_agent = _header(headers, "User-Agent")
+    key_presented = _header(headers, CLIENT_KEY_HEADER)
+    named = declared or _header(headers, IDENTITY_HEADER) or _header(headers, LEGACY_IDENTITY_HEADER)
+
+    matched = ""
+    if identity.source == SOURCE_USER_AGENT:
+        found = clients.match_user_agent(user_agent)
+        matched = found[1] if found else ""
+    elif identity.source == SOURCE_HEADER:
+        matched = named or ""
+    elif identity.source == SOURCE_KEY:
+        matched = identity.detail
+
+    policy, channels_description = _policy_for(unknown_client, detok_channels)
+    decision = policy.decide_for_client(identity.channel) if policy else DECISION_KEEP
+
+    notes: list[str] = []
+    if not identity.recognized:
+        if identity.detail == "key_not_configured":
+            notes.append(
+                "ключ предъявлен, но отпечатка нет в таблице: опознание НЕ понижено до "
+                "User-Agent — запрос считается неопознанным"
+            )
+        elif user_agent and not any(record.user_agent_patterns for record in clients):
+            notes.append(
+                "шаблонов User-Agent в таблице нет — опознавать эту строку нечем "
+                "(добавить шаблон: --trusted-clients \"канал=ua:*шаблон*\")"
+            )
+    if decision == DECISION_KEEP and identity.recognized:
+        if identity.channel in BLOCKED_CHANNELS:
+            notes.append(
+                f"канал {identity.channel!r} вне контура: значения не восстанавливаются никогда, "
+                "доверенным клиентом он быть не может"
+            )
+        else:
+            notes.append(
+                "канал назван, но в списке каналов восстановления его нет: список остаётся "
+                "суженным, опознание клиента его не расширяет"
+            )
+    for pattern in versioned_patterns(clients):
+        notes.append(
+            f"шаблон {pattern!r} содержит цифры: если это номер версии, при обновлении клиента "
+            "шаблон перестанет совпадать молча — лучше шаблон без версии"
+        )
+    if policy is None:
+        notes.append(
+            "настройка каналов противоречива: канал вне контура в списке восстановления — "
+            "служба с такой настройкой не стартует"
+        )
+
+    if identity.recognized:
+        why = (
+            "канал назван, и он разрешён списком каналов"
+            if decision == DECISION_DETOKENIZE
+            else "канал назван, но восстановление для него не разрешено"
+        )
+    elif policy is None:
+        why = "опознания нет, а список каналов задан противоречиво"
+    elif unknown_client == UNKNOWN_KEEP_CODES:
+        why = "клиент не назвался ничем → настройка unknown_client: значения не восстанавливаются"
+    else:
+        why = "клиент не назвался ничем → режим restore: судит список каналов"
+
+    return {
+        "recognized": identity.recognized,
+        "channel": identity.channel or "",
+        "source": identity.source,
+        "source_detail": identity.detail,
+        "matched": matched,
+        "key_presented": bool(key_presented),
+        "user_agent": user_agent or "",
+        "unknown_client": unknown_client,
+        "detok_channels": channels_description,
+        "decision": decision,
+        "why": why,
+        "clients_source": clients_source,
+        "clients": clients.describe(),
+        "notes": notes,
+    }
+
+
+def _fingerprint_short(value: str) -> str:
+    """Усечь отпечаток ключа для печати: оператору нужно узнать запись, а не весь хеш."""
+    text = str(value or "")
+    if text.startswith(FINGERPRINT_PREFIX) and len(text) > len(FINGERPRINT_PREFIX) + 16:
+        return text[: len(FINGERPRINT_PREFIX) + 16] + "…"
+    return text
+
+
+def _records_word(count: int) -> str:
+    """Вернуть «запись», «записи» или «записей»: отчёт читает человек, а не разборщик."""
+    dozens = count % 100
+    if 11 <= dozens <= 14:
+        return "записей"
+    last = count % 10
+    if last == 1:
+        return "запись"
+    if last in (2, 3, 4):
+        return "записи"
+    return "записей"
+
+
+def format_check(report: Mapping[str, object]) -> str:
+    """Собрать человеческий отчёт прибора «проверить строку».
+
+    # START_CONTRACT: format_check
+    #   PURPOSE: Показать решение словами: канал, источник, чем совпало и что было бы при неопознанном клиенте.
+    #   INPUTS: { report: Mapping[str, object] - отчёт fn-check_report }
+    #   OUTPUTS: { str - текст для терминала }
+    #   SIDE_EFFECTS: none
+    #   LINKS: M-CLIENT-IDENTITY, docs/OPERATIONS.md
+    # END_CONTRACT: format_check
+    """
+    clients = report.get("clients")
+    clients = clients if isinstance(clients, Mapping) else {}
+    channels = clients.get("channels")
+    channels = [str(item) for item in channels] if isinstance(channels, list) else []
+    entries = clients.get("entries")
+    entries = entries if isinstance(entries, list) else []
+    lines = [
+        "Опознание клиента (M-CLIENT-IDENTITY)",
+        "",
+        f"  таблица:    {clients.get('records', 0)} {_records_word(int(clients.get('records') or 0))}, каналы: "
+        + (", ".join(channels) or "—")
+        + f" ({report.get('clients_source', '')})",
+    ]
+    user_agent = str(report.get("user_agent") or "")
+    lines.append(f"  User-Agent: {user_agent or 'не предъявлен'}")
+    lines.append(
+        "  заголовки:  X-PII-Channel / X-Hermes-Channel — см. источник ниже; "
+        f"X-PII-Client-Key: {'предъявлен' if report.get('key_presented') else 'не предъявлен'}"
+    )
+    lines.append("")
+    channel = str(report.get("channel") or "")
+    source = str(report.get("source") or SOURCE_NONE)
+    if report.get("recognized"):
+        lines.append(f"  канал:      {channel}")
+        lines.append(f"  источник:   {source}")
+    else:
+        lines.append("  канал:      не опознан")
+        lines.append(f"  источник:   {source} (ничем себя не назвал)")
+    matched = str(report.get("matched") or "")
+    if matched:
+        shown = _fingerprint_short(matched) if source == SOURCE_KEY else matched
+        lines.append(f"  совпало:    {shown}")
+    lines.append(f"  дальше:     unknown_client = {report.get('unknown_client')}")
+    lines.append(f"  каналы:     {report.get('detok_channels')}")
+    lines.append(f"  решение:    {report.get('decision')} — {report.get('why')}")
+    notes = report.get("notes")
+    notes = notes if isinstance(notes, list) else []
+    if notes:
+        lines.append("")
+        lines.append("  предупреждения:")
+        for note in notes:
+            lines.append(f"    - {note}")
+    if entries and source == SOURCE_NONE:
+        lines.append("")
+        lines.append("  записи таблицы (канал — способы):")
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            methods = entry.get("methods")
+            methods = [str(item) for item in methods] if isinstance(methods, list) else []
+            lines.append(
+                f"    - {entry.get('channel')}: {', '.join(methods)}"
+                + (" (ключ)" if entry.get("has_key") else "")
+            )
+    return "\n".join(lines)
+# END_BLOCK_CHECK_CLI
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Напечатать отпечаток ключа — то, что владелец вписывает в trusted_clients.
+    """Напечатать отпечаток ключа либо проверить, как опознаётся клиент.
 
     # START_CONTRACT: main
-    #   PURPOSE: Дать владельцу получить отпечаток ключа, не оставляя ключ в настройках.
+    #   PURPOSE: Дать владельцу получить отпечаток ключа, не оставляя ключ в настройках, и увидеть решение опознания до правки службы.
     #   INPUTS: { argv: Sequence[str] | None - аргументы командной строки }
     #   OUTPUTS: { int - код возврата }
-    #   SIDE_EFFECTS: читает аргументы и печатает отпечаток
+    #   SIDE_EFFECTS: читает аргументы, читает файл настроек и файл заголовков, печатает отчёт
     #   LINKS: M-CLIENT-IDENTITY, docs/OPERATIONS.md
     # END_CONTRACT: main
 
-    Запуск: ``python3 -m src.client_identity <ключ>``. В командной строке ключ виден в истории
-    оболочки, поэтому в эксплуатации он читается из файла: ``python3 -m src.client_identity
-    "$(cat /etc/pii-proxy/client-keys/cursor)"``.
+    Запуск: ``python3 -m src.client_identity <ключ>`` — отпечаток ключа. В командной строке ключ
+    виден в истории оболочки, поэтому в эксплуатации он читается из файла: ``python3 -m
+    src.client_identity "$(cat /etc/pii-proxy/client-keys/cursor)"``.
+
+    ``python3 -m src.client_identity check ...`` — прибор «проверить строку»: по фактическим
+    заголовкам или строке User-Agent показывает канал, источник и что было бы при неопознанном
+    клиенте (см. CHECK_USAGE).
     """
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 1 or args[0] in {"-h", "--help"}:
-        print("usage: python3 -m src.client_identity <key>")
-        return 0 if args[:1] in (["-h"], ["--help"]) else 2
+    if args[:1] in (["-h"], ["--help"]):
+        print(CHECK_USAGE, end="")
+        return 0
+    if args[:1] == [CHECK_COMMAND]:
+        return _run_check(args[1:])
+    if args[:1] == [KEY_COMMAND]:
+        args = args[1:]
+    if len(args) != 1:
+        print(CHECK_USAGE, end="")
+        return 2
     print(fingerprint(args[0]))
+    return 0
+
+
+def _run_check(argv: Sequence[str]) -> int:
+    """Разобрать аргументы прибора «проверить строку» и напечатать отчёт."""
+    parser = argparse.ArgumentParser(
+        prog="python3 -m src.client_identity check",
+        description="Показать, каким каналом и каким источником опознан клиент.",
+        add_help=True,
+    )
+    parser.add_argument("user_agent", nargs="?", default=None, help="строка User-Agent")
+    parser.add_argument("-a", "--user-agent", dest="user_agent_option", default=None)
+    parser.add_argument("--header", action="append", default=[], metavar="Имя: значение")
+    parser.add_argument("--headers-file", default=None, metavar="ФАЙЛ")
+    parser.add_argument("--trusted-clients", default=None, metavar="СТРОКА")
+    parser.add_argument("--config", default=None, metavar="ФАЙЛ")
+    parser.add_argument("--unknown-client", default=UNKNOWN_KEEP_CODES, choices=sorted(UNKNOWN_CLIENT_MODES))
+    parser.add_argument("--detok-channels", default=None, metavar="СПИСОК")
+    parser.add_argument("--declared", default=None, metavar="КАНАЛ")
+    parser.add_argument("--json", action="store_true")
+    try:
+        options = parser.parse_args(list(argv))
+    except SystemExit as exc:  # argparse печатает свою справку
+        return int(exc.code or 0)
+
+    raw_clients = options.trusted_clients
+    detok_channels: list[str] = []
+    try:
+        unknown_client = options.unknown_client
+        if options.config:
+            overlay = read_config_overlay(options.config)
+            if raw_clients is None:
+                raw_clients = overlay.get("trusted_clients")
+            if "--unknown-client" not in argv and overlay.get("unknown_client"):
+                unknown_client = str(overlay["unknown_client"])
+            if options.detok_channels is None and "detok_channels" in overlay:
+                raw_detok = overlay.get("detok_channels")
+                detok_channels = (
+                    [str(raw_detok)]
+                    if isinstance(raw_detok, str)
+                    else [str(item) for item in raw_detok or []]
+                )
+        if options.detok_channels is not None:
+            detok_channels = [options.detok_channels]
+
+        headers = parse_header_lines(options.header)
+        if options.headers_file:
+            if options.headers_file == "-":
+                headers.update(parse_header_lines(sys.stdin.read().splitlines()))
+            else:
+                with open(options.headers_file, "r", encoding="utf-8") as handle:
+                    headers.update(parse_header_lines(handle.read().splitlines()))
+        user_agent = options.user_agent_option or options.user_agent
+        if user_agent:
+            headers["User-Agent"] = user_agent
+        clients, where = load_clients(raw_clients, options.config)
+        report = check_report(
+            headers,
+            clients,
+            clients_source=where,
+            unknown_client=unknown_client,
+            detok_channels=detok_channels,
+            declared=options.declared,
+        )
+    except ClientIdentityError as exc:
+        print(exc.message, file=sys.stderr)
+        return 2
+    if options.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_check(report))
     return 0
 
 

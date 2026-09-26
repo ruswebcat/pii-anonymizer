@@ -14,19 +14,24 @@
 #   payload_with_pii - тело запроса со значениями клиента
 #   TrustedClientsParsingTests - разбор раздела настроек: перечень, компактная строка, JSON, отказы
 #   ClientRecognitionTests - три способа опознания, их порядок и запрет понижения
+#   CheckCliTests - прибор «проверить строку»: канал, источник, совпавший шаблон и решение
 #   UnknownClientPolicyTests - обе политики для неопознанного клиента
 #   IdentificationIndependenceTests - обезличивание, кэш и healthz не зависят от опознания клиента
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.0.0 - решение владельца 26.09.2026: опознание доверенных клиентов по заголовку, отпечатку ключа доступа и User-Agent с безопасным поведением для неопознанного клиента.
+#   LAST_CHANGE: v1.1.0 - прибор «проверить строку»: опознание по готовым заголовкам и по файлу заголовков, предупреждение о шаблоне с номером версии, объяснение режима unknown_client.
+#   PREVIOUS: v1.0.0 - решение владельца 26.09.2026: опознание доверенных клиентов по заголовку, отпечатку ключа доступа и User-Agent с безопасным поведением для неопознанного клиента.
 # END_CHANGE_SUMMARY
 
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -39,6 +44,7 @@ from src.channel_policy import (  # noqa: E402
     ChannelPolicyError,
 )
 from src.client_identity import (  # noqa: E402
+    CHECK_COMMAND,
     CLIENT_KEY_HEADER,
     IDENTITY_HEADER,
     LEGACY_IDENTITY_HEADER,
@@ -49,9 +55,16 @@ from src.client_identity import (  # noqa: E402
     SOURCE_USER_AGENT,
     ClientIdentityError,
     TrustedClients,
+    check_report,
+    format_check,
     identify_client,
     fingerprint,
+    load_clients,
+    main as identity_main,
+    parse_header_lines,
     parse_trusted_clients,
+    read_config_overlay,
+    versioned_patterns,
 )
 from src.normalize import normalize  # noqa: E402
 from src.router import build_service  # noqa: E402
@@ -332,6 +345,208 @@ class ClientRecognitionTests(unittest.TestCase):
         self.assertEqual("cursor", identity.channel)
         self.assertEqual(SOURCE_HEADER, identity.source)
         self.assertIsNone(identify_client({"User-Agent": "Cursor/0.42"}, TrustedClients()).channel)
+
+
+class CheckCliTests(unittest.TestCase):
+    """Прибор «проверить строку»: канал, источник и решение до правки службы."""
+
+    READY = (
+        "cursor=ua:*cursor*;codex=ua:*codex*;claude-code=ua:*claude-cli*;"
+        "office=header:office"
+    )
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        """Запустить прибор с перехватом печати: тест читает то же, что увидит оператор."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = identity_main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _notes(report: dict[str, object]) -> list[str]:
+        """Вернуть предупреждения отчёта списком: отчёт для машинного чтения — словарь."""
+        notes = report["notes"]
+        return [str(note) for note in notes] if isinstance(notes, list) else []
+
+    @staticmethod
+    def _value(report: dict[str, object], key: str) -> str:
+        """Вернуть значение поля отчёта строкой."""
+        return str(report[key])
+
+    def test_the_matched_pattern_is_named_for_a_user_agent(self) -> None:
+        code, out, _err = self._run(
+            ["check", "Cursor/2.0 (darwin arm64) vscode/1.9", "--trusted-clients", self.READY]
+        )
+        self.assertEqual(0, code)
+        self.assertIn("канал:      cursor", out)
+        self.assertIn(SOURCE_USER_AGENT, out)
+        self.assertIn("совпало:    *cursor*", out)
+        self.assertIn("detokenize", out)
+
+    def test_the_report_says_what_would_happen_without_any_name(self) -> None:
+        """Главный вопрос оператора: что получит клиент, который себя не назвал."""
+        code, out, _err = self._run(["check", "--trusted-clients", self.READY])
+        self.assertEqual(0, code)
+        self.assertIn("канал:      не опознан", out)
+        self.assertIn(f"unknown_client = {UNKNOWN_KEEP_CODES}", out)
+        self.assertIn("keep — клиент не назвался ничем", out)
+
+        code, out, _err = self._run(
+            ["check", "--unknown-client", UNKNOWN_RESTORE, "--trusted-clients", self.READY]
+        )
+        self.assertEqual(0, code)
+        self.assertIn("restore: судит список каналов", out)
+
+    def test_a_presented_key_without_a_fingerprint_is_not_downgraded(self) -> None:
+        code, out, _err = self._run(
+            [
+                "check",
+                "--header", f"{CLIENT_KEY_HEADER}: unknown-stub-key",
+                "--header", "User-Agent: Cursor/2.0",
+                "--trusted-clients", self.READY,
+            ]
+        )
+        self.assertEqual(0, code)
+        self.assertIn("канал:      не опознан", out)
+        self.assertIn("НЕ понижено до User-Agent", out)
+
+    def test_a_key_that_is_in_the_table_is_reported_with_its_channel(self) -> None:
+        report = check_report(
+            {CLIENT_KEY_HEADER: CURSOR_KEY},
+            parse_trusted_clients([{"channel": "editor", "key_sha256": CURSOR_KEY_FINGERPRINT}]),
+        )
+        self.assertTrue(report["recognized"])
+        self.assertEqual("editor", report["channel"])
+        self.assertEqual(SOURCE_KEY, report["source"])
+        # В человеческом отчёте отпечаток усечён: оператору нужно узнать запись, а не весь хеш.
+        self.assertIn("sha256:", format_check(report))
+        self.assertNotIn(CURSOR_KEY_FINGERPRINT, format_check(report))
+
+    def test_the_table_and_the_modes_come_from_a_config_file(self) -> None:
+        """Прибор читает тот же файл настроек, что и служба, а не свою копию правил."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "trusted_clients": [{"channel": "cursor", "user_agent": "*cursor*"}],
+                        "unknown_client": UNKNOWN_RESTORE,
+                        "detok_channels": ["mattermost"],
+                    },
+                    handle,
+                )
+            code, out, _err = self._run(["check", "Cursor/2.0", "--config", path])
+            self.assertEqual(0, code)
+            self.assertIn("канал:      cursor", out)
+            self.assertIn(f"unknown_client = {UNKNOWN_RESTORE}", out)
+            self.assertIn("mattermost (список сужен)", out)
+            overlay = read_config_overlay(path)
+            self.assertEqual("mattermost", overlay["detok_channels"][0])
+
+    def test_a_channel_outside_a_narrowed_list_is_reported_as_kept(self) -> None:
+        report = check_report(
+            {IDENTITY_HEADER: "office"},
+            parse_trusted_clients(self.READY),
+            detok_channels=["mattermost"],
+        )
+        self.assertEqual("office", self._value(report, "channel"))
+        self.assertEqual("keep", self._value(report, "decision"))
+        self.assertTrue(any("суженным" in note for note in self._notes(report)), self._notes(report))
+
+    def test_a_channel_outside_the_perimeter_is_flagged(self) -> None:
+        report = check_report({IDENTITY_HEADER: "telegram"}, parse_trusted_clients(self.READY))
+        self.assertEqual("keep", self._value(report, "decision"))
+        self.assertTrue(
+            any("вне контура" in note for note in self._notes(report)), self._notes(report)
+        )
+
+    def test_a_pattern_with_a_version_number_is_flagged(self) -> None:
+        """Шаблон с номером версии перестанет совпадать при обновлении клиента — молча."""
+        clients = parse_trusted_clients("desk=ua:Desk/2.x;cursor=ua:*cursor*")
+        self.assertEqual(["Desk/2.x"], versioned_patterns(clients))
+        report = check_report({"User-Agent": "Desk/2.x"}, clients)
+        self.assertTrue(
+            any("содержит цифры" in note for note in self._notes(report)), self._notes(report)
+        )
+
+    def test_the_user_agent_can_come_from_a_file_of_headers(self) -> None:
+        """Файл заголовков пишет заглушка (tools/ua_probe.py), а читает прибор."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "headers.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# снято заглушкой\nUser-Agent: claude-cli/2.1.2 (external, cli)\n")
+            code, out, _err = self._run(
+                ["check", "--headers-file", path, "--trusted-clients", self.READY]
+            )
+            self.assertEqual(0, code)
+            self.assertIn("канал:      claude-code", out)
+            self.assertIn("*claude-cli*", out)
+
+    def test_headers_can_come_from_the_standard_input(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with unittest.mock.patch("sys.stdin", io.StringIO("User-Agent: Codex/1.0\n")):
+                code = identity_main(
+                    ["check", "--headers-file", "-", "--trusted-clients", self.READY]
+                )
+        self.assertEqual(0, code)
+        self.assertIn("канал:      codex", out.getvalue())
+
+    def test_the_report_is_machine_readable_on_request(self) -> None:
+        code, out, _err = self._run(
+            ["check", "Cursor/2.0", "--trusted-clients", self.READY, "--json"]
+        )
+        self.assertEqual(0, code)
+        report = json.loads(out)
+        self.assertEqual("cursor", report["channel"])
+        self.assertEqual(SOURCE_USER_AGENT, report["source"])
+        self.assertEqual("*cursor*", report["matched"])
+        self.assertEqual(UNKNOWN_KEEP_CODES, report["unknown_client"])
+        self.assertEqual("detokenize", report["decision"])
+
+    def test_the_key_command_still_prints_a_fingerprint(self) -> None:
+        bare = fingerprint("stub-key-for-cli")
+        for argv in (["key", "stub-key-for-cli"], ["stub-key-for-cli"]):
+            with self.subTest(argv=argv):
+                code, out, _err = self._run(argv)
+                self.assertEqual(0, code)
+                self.assertEqual(bare, out.strip())
+
+    def test_help_lists_both_commands(self) -> None:
+        code, out, _err = self._run(["--help"])
+        self.assertEqual(0, code)
+        self.assertIn(CHECK_COMMAND, out)
+        self.assertIn("key", out)
+
+    def test_an_empty_command_line_prints_the_usage(self) -> None:
+        code, out, _err = self._run([])
+        self.assertEqual(2, code)
+        self.assertIn("usage:", out)
+
+    def test_a_broken_header_line_is_refused_with_words(self) -> None:
+        code, _out, err = self._run(["check", "--header", "нет двоеточия"])
+        self.assertEqual(2, code)
+        self.assertIn("Name: value", err)
+        with self.assertRaises(ClientIdentityError):
+            parse_header_lines(["нет двоеточия"])
+
+    def test_header_lines_ignore_comments_and_blank_lines(self) -> None:
+        headers = parse_header_lines(["# снято заглушкой", "", "User-Agent: Cursor/2.0"])
+        self.assertEqual({"User-Agent": "Cursor/2.0"}, headers)
+
+    def test_an_unreadable_config_file_is_explained(self) -> None:
+        code, _out, err = self._run(["check", "--config", "/nonexistent/pii-proxy/config.json"])
+        self.assertEqual(2, code)
+        self.assertIn("config", err)
+
+    def test_the_table_can_come_from_the_environment_form(self) -> None:
+        """Компактная строка — тот же раздел, что стоит в файле окружения службы."""
+        clients, where = load_clients("office=header:office;desk=ua:*desk*")
+        self.assertEqual(("desk", "office"), clients.channels)
+        self.assertIn("--trusted-clients", where)
+        empty, note = load_clients(None, None)
+        self.assertEqual(0, len(empty))
+        self.assertIn("пустая", note)
 
 
 class UnknownClientPolicyTests(unittest.TestCase):
