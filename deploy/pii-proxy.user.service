@@ -1,0 +1,31 @@
+[Unit]
+Description=PII anonymization proxy (LLM guard, user instance)
+# Documentation=<адрес вашего репозитория>
+After=network-online.target
+Wants=network-online.target
+# A configuration error must surface as a failed unit, not as an endless restart
+# loop: five attempts in a minute, then stop.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/cursor/development/pii-proxy
+EnvironmentFile=%h/.config/pii-proxy/pii-proxy.env
+# Интерпретатор и каталог кода задайте свои (пример — виртуальное окружение проекта):
+ExecStart=%h/pii-proxy/venv/bin/python3 -m src.router
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+# NoNewPrivileges and ProtectHome=read-only are not available in every user
+# manager build, so the user unit keeps only the directives that apply there.
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Memory policy: hard ceiling for a 2 GB host (measured numbers - docs/OPERATIONS.md).
+MemoryHigh=200M
+MemoryMax=400M
+
+[Install]
+WantedBy=default.target

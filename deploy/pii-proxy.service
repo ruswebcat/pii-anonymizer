@@ -1,0 +1,42 @@
+[Unit]
+Description=PII anonymization proxy (LLM guard)
+# Documentation=<адрес вашего репозитория>
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Замените на пользователя, от которого работает контур (не запускайте от root):
+User=pii-proxy
+Group=pii-proxy
+WorkingDirectory=/opt/pii-proxy
+EnvironmentFile=/etc/pii-proxy/pii-proxy.env
+ExecStart=/opt/pii-proxy/venv/bin/python3 -m src.router
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+# Hardening: the process only needs to read its own code, write its store and
+# journal under /var/lib and /var/log, and reach the provider endpoints.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/lib/pii-proxy /var/log/pii-proxy
+
+# Memory policy: the target from the statement of work is RSS <= 150 MB for the
+# core pipeline. The optional morphology backend (M-NER) loads ~17 MB of
+# dictionaries plus its own working set, so MemoryHigh is a soft throttle and
+# MemoryMax is a hard ceiling well above the measured footprint (measured
+# numbers - docs/OPERATIONS.md).
+MemoryHigh=200M
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

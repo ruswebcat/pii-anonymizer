@@ -1,0 +1,20 @@
+# --- secrets and personal data: never in git -------------------------------
+*.key
+pii_dict*.json
+pii_map.db
+audit.jsonl
+state/
+*.log
+
+# --- local tooling ---------------------------------------------------------
+__pycache__/
+*.pyc
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*.tmp
+.dict-*.tmp
