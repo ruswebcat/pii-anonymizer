@@ -1,16 +1,16 @@
 # FILE: src/router.py
-# VERSION: 1.4.2
+# VERSION: 1.5.0
 # START_MODULE_CONTRACT
-#   PURPOSE: Serve the local HTTP endpoint the agent talks to and orchestrate the fail-closed pipeline: image policy, tokenization, validation, degradation of residual findings, upstream forwarding, detokenization, audit.
-#   SCOPE: route parsing for ds and nord prefixes, chat completion pipeline, residual repair instead of refusal (Вариант 1), healthz status, JSON error shapes, service assembly and systemd entry point, hot reload of the client dictionary and of the open name layer, incident journal on residual findings.
-#   DEPENDS: M-CONFIG, M-TOKENIZER, M-DETOKENIZER, M-VALIDATOR, M-UPSTREAM, M-AUDIT, M-MAP-STORE, M-DICT, M-NAME-LAYER, M-INCIDENT-JOURNAL
+#   PURPOSE: Serve the local HTTP endpoint the agent talks to and orchestrate the fail-closed pipeline: client identification, image policy, tokenization, validation, degradation of residual findings, upstream forwarding, detokenization, audit.
+#   SCOPE: route parsing for ds and nord prefixes, client identification (channel header, access key fingerprint, User-Agent, declared delivery marker), chat completion pipeline, residual repair instead of refusal (Вариант 1), healthz status, JSON error shapes, service assembly and systemd entry point, hot reload of the client dictionary and of the open name layer, incident journal on residual findings.
+#   DEPENDS: M-CONFIG, M-CLIENT-IDENTITY, M-TOKENIZER, M-DETOKENIZER, M-VALIDATOR, M-UPSTREAM, M-AUDIT, M-MAP-STORE, M-DICT, M-NAME-LAYER, M-INCIDENT-JOURNAL
 #   LINKS: M-ROUTER, V-M-ROUTER, export-app, fn-handle_chat_completions, fn-handle_healthz, fn-main
 #   ROLE: RUNTIME
 #   MAP_MODE: EXPORTS
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
-#   CHANNEL_HEADER - request header carrying the transport channel
+#   CHANNEL_HEADER - прежний заголовок канала (совместимость)
 #   CHANNEL_MARKER - метка доставки платформы в системном промпте
 #   ORIGIN_PLATFORM - объявление платформы текущего сообщения (Gateway message origin)
 #   ROUTE_PATTERN - path pattern splitting route prefix from upstream path
@@ -19,6 +19,7 @@
 #   _RepairOutcome - итог второго прохода по остатку: замены, коды, правила, признак попытки
 #   ProxyService - orchestration of the whole pipeline
 #   fn-handle_chat_completions - full request pipeline with fail-closed semantics
+#   fn-_resolve_channel - канал запроса: опознание клиента, затем объявленная метка
 #   fn-refresh_dictionary - перечитать клиентский словарь по изменению файла
 #   fn-refresh_name_layer - перечитать открытый слой распознавания по изменению файла
 #   fn-record_incident - записать промах детектора классами и числами
@@ -29,24 +30,30 @@
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.3.0 - сборка службы устанавливает лексику оператора из настроек до сборки детекторов; healthz показывает её размеры по разделам; точка входа читает необязательный файл настроек.
-#   LAST_CHANGE: v1.4.3 - Phase-18 (23.09.2026): алерты службы умеют уходить в Telegram (Bot API, только стандартная библиотека) — чат и тема задаются настройками, Telegram предпочитается Mattermost; сбой доставки по-прежнему не ломает конвейер.
-#   PREVIOUS: v1.4.2 - Phase-17 шаг 6 (20.09.2026): восстановлена функция `_make_alert_sender` (её вызов остался в `main`, и служба падала с NameError на старте) и убран осиротевший блок её тела внутри `_require_registry_integrity`, где он обращался к несуществующему `config`; статическая проверка символов точки входа ловит этот класс отказов без запуска службы.
+#   LAST_CHANGE: v1.5.0 - решение владельца 26.09.2026: клиент опознаётся по заголовку, отпечатку ключа доступа и User-Agent (M-CLIENT-IDENTITY), а не только по метке Hermes; неопознанный клиент получает решение настройки unknown_client; healthz показывает доверенные каналы и режим для неизвестных.
+#   PREVIOUS: v1.4.3 - Phase-18 (23.09.2026): алерты службы умеют уходить в Telegram (Bot API, только стандартная библиотека) — чат и тема задаются настройками, Telegram предпочитается Mattermost; сбой доставки по-прежнему не ломает конвейер.
+#   EARLIER: v1.4.2 - Phase-17 шаг 6 (20.09.2026): восстановлена функция `_make_alert_sender` (её вызов остался в `main`, и служба падала с NameError на старте) и убран осиротевший блок её тела внутри `_require_registry_integrity`, где он обращался к несуществующему `config`; статическая проверка символов точки входа ловит этот класс отказов без запуска службы.
 #   EARLIER: v1.4.1 - дефект-фикс 19.09.2026: счётчику кэша провайдера отдаётся служебный кадр потока (`usage`) — попадание в кэш DeepSeek, названное владельцем ключевым фактором приёмки, теперь измеряется и на потоковом пути, которым ходят мессенджеры.
-#   PREVIOUS: v1.4.0 - дефект-фикс 19.09.2026: канал берётся не только из метки доставки в системном промпте, но и из объявления происхождения текущего сообщения; расхождение метки и объявления разрешается в сторону запрета восстановления значений. Инцидент перестаёт терять канал у восстановленных сессий, где метки нет вовсе.
-#   EARLIER: v1.3.1 - дефект-фикс 19.09.2026: отказ заслона по остатку ПД возвращается кодом 422, а не 403.
+#   EARLIER: v1.4.0 - дефект-фикс 19.09.2026: канал берётся не только из метки доставки в системном промпте, но и из объявления происхождения текущего сообщения; расхождение метки и объявления разрешается в сторону запрета восстановления значений. Инцидент перестаёт терять канал у восстановленных сессий, где метки нет вовсе.
 #   EARLIER: v1.3.0 - Phase-15 шаг 2 (Вариант 1): остаток ПД заменяется вторым проходом и запрос доходит до провайдера (действие degraded_tokenized в журнале аудита и инцидент без значений); жёсткая блокировка остаётся только там, где замена не удалась.
+#   EARLIER: v1.3.0 - сборка службы устанавливает лексику оператора из настроек до сборки детекторов; healthz показывает её размеры по разделам; точка входа читает необязательный файл настроек.
 #   EARLIER: v1.2.0 - Phase-15 шаг 1: остаток ПД записывается в журнал инцидентов действием blocked (значений в записи нет), журнал поднимается в build_service и виден в healthz счётчиком незаписанных.
 # END_CHANGE_SUMMARY
 
 """HTTP entry point.
 
 Implements M-ROUTER from docs/ARCHITECTURE.md. The order of steps is part
-of the contract and is asserted by tests: config, image policy, tokenization,
-validation, upstream, detokenization, audit. Any failure before the upstream call
-results in a 4xx and zero outbound requests (UC-005): a residual-PII block answers
-422 (the client must read the real reason, not "your API key was rejected"), while
-technical fail-closed failures keep 403.
+of the contract and is asserted by tests: config, client identification, image
+policy, tokenization, validation, upstream, detokenization, audit. Any failure
+before the upstream call results in a 4xx and zero outbound requests (UC-005): a
+residual-PII block answers 422 (the client must read the real reason, not "your
+API key was rejected"), while technical fail-closed failures keep 403.
+
+Client identification (since 26.09.2026) names the channel in this order: the
+channel header, the access-key fingerprint, the User-Agent table, and only then
+the delivery marker Hermes leaves in the system prompt. A request that none of
+them names is an unidentified client, and the ``unknown_client`` setting decides
+its fate — the public build keeps the codes.
 """
 
 from __future__ import annotations
@@ -59,7 +66,7 @@ import re
 import threading
 import urllib.request
 import uuid
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -68,6 +75,12 @@ from typing import Any, Callable, Sequence
 from src.audit import AuditEvent, AuditJournal
 from src.cache import TokenizationCache
 from src.channel_policy import ChannelPolicy
+from src.client_identity import (
+    IDENTITY_HEADER,
+    TrustedClients,
+    identify_client,
+    declared_identity,
+)
 from src.config import ProxyConfig, load_config
 from src.detect_name import NameDetector
 from src.detect_ner import NerDetector
@@ -224,6 +237,45 @@ def _origin_channel(payload: dict) -> str | None:
         if match:
             found = match.group(1).strip().lower()
     return found
+
+
+# START_BLOCK_RESOLVE_CHANNEL
+def _resolve_channel(
+    payload: dict,
+    declared: str | None,
+    headers: Mapping[str, str] | None,
+    trusted: TrustedClients,
+    allowed: Collection[str],
+) -> tuple[str | None, str]:
+    """Назвать канал запроса и источник, которым он опознан.
+
+    # START_CONTRACT: _resolve_channel
+    #   PURPOSE: Свести четыре источника канала в один порядок и честно вернуть «не опознан».
+    #   INPUTS: { payload: dict - тело запроса, declared: str | None - канал из заголовка вызывающего, headers: Mapping[str, str] | None - заголовки запроса, trusted: TrustedClients - таблица доверенных клиентов, allowed: Collection[str] - каналы, где восстановление разрешено }
+    #   OUTPUTS: { (channel | None, source) - канал и источник опознания }
+    #   SIDE_EFFECTS: none
+    #   LINKS: M-CLIENT-IDENTITY, M-CHANNEL-POLICY, V-M-CHANNEL-POLICY
+    # END_CONTRACT: _resolve_channel
+
+    Порядок источников — решение владельца 26.09.2026, сверху вниз: явный заголовок, отпечаток
+    ключа доступа, шаблон User-Agent, и только затем метка доставки внутри запроса (путь Hermes,
+    которому заголовок поставить нечем). Пустой результат означает «клиент не назвался ничем» —
+    и тогда решение принимает настройка «поведение для неизвестного клиента», а не этот разбор.
+
+    Заголовок и User-Agent подделываются, поэтому расширить восстановление они не могут: канал,
+    названный *текстом запроса* (метка доставки), проходит ту же политику каналов, а каналы вне
+    контура остаются запрещёнными при любом источнике.
+    """
+    identity = identify_client(headers, trusted, declared=declared)
+    if identity.recognized:
+        return identity.channel, identity.source
+    # Метка доставки — четвёртый источник: она описывает канал, а не клиента, и потому идёт после
+    # трёх способов опознания самого клиента.
+    declared_channel = declared_identity(_channel_from_payload(payload, allowed))
+    if declared_channel.recognized:
+        return declared_channel.channel, declared_channel.source
+    return None, identity.source
+# END_BLOCK_RESOLVE_CHANNEL
 
 
 ROUTE_PATTERN = re.compile(r"^/(?P<route>[A-Za-z0-9_-]+)(?P<path>/.*)$")
@@ -738,31 +790,38 @@ class ProxyService:
         return False
 
     def handle_chat_completions(
-        self, payload: dict, route: str, path: str, channel: str | None
+        self,
+        payload: dict,
+        route: str,
+        path: str,
+        channel: str | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> tuple[int, dict] | StreamResponse:
         """Run the full pipeline for one chat completion request.
 
         # START_CONTRACT: handle_chat_completions
         #   PURPOSE: Anonymize, validate, forward, restore, audit.
-        #   INPUTS: { payload: dict - request body, route: str - ds or nord, path: str - upstream path, channel: str | None - transport channel }
+        #   INPUTS: { payload: dict - request body, route: str - ds or nord, path: str - upstream path, channel: str | None - канал из заголовка вызывающего, headers: Mapping[str, str] | None - заголовки запроса (ключ клиента, User-Agent) }
         #   OUTPUTS: { tuple[int, dict] - status and body, or StreamResponse - frame stream (Phase-11) }
         #   SIDE_EFFECTS: store writes, journal writes, outbound provider call
-        #   LINKS: M-TOKENIZER, M-VALIDATOR, M-UPSTREAM, M-DETOKENIZER, M-STREAM-RELAY, V-M-ROUTER
+        #   LINKS: M-CLIENT-IDENTITY, M-TOKENIZER, M-VALIDATOR, M-UPSTREAM, M-DETOKENIZER, M-STREAM-RELAY, V-M-ROUTER
         # END_CONTRACT: handle_chat_completions
         """
         session_id = self.new_session_id()
         self.refresh_dictionary()
         self.refresh_name_layer()
         # The transport channel decides whether restored values may be shown at
-        # all, and the agent does not send a header for it (checked in the Hermes
-        # source on 16.09.2026). Hermes does inject per-platform hint text into the
-        # system prompt, so the channel travels as a marker inside the request:
-        # without it the decision stays "no restore", which is the safe default.
-        # Дефект 19.09.2026: метки в системном промпте может не быть (восстановленная
-        # сессия) или она описывает платформу сессии, а не текущего сообщения. Помимо
-        # метки читаем объявление происхождения последнего сообщения; расхождение
-        # решается в сторону запрета восстановления (см. _channel_from_payload).
-        channel = channel or _channel_from_payload(payload, self._config.detok_channels)
+        # all. Until 26.09.2026 the only source was the delivery marker Hermes
+        # injects into the system prompt, because the agent sends no header
+        # (checked in the Hermes source on 16.09.2026). Standalone AI clients
+        # (Cursor, Claude Code, Codex) send no such marker, so since 26.09.2026
+        # the channel is learned from the client itself — header, access-key
+        # fingerprint, User-Agent — and the marker is only the last resort.
+        # Не опознан ни один источник — решение принимает настройка
+        # «поведение для неизвестного клиента» (см. ChannelPolicy.decide_for_client).
+        channel, channel_source = _resolve_channel(
+            payload, channel, headers, self._config.trusted_clients, self._config.detok_channels
+        )
 
         if route not in self._config.routes:
             self._audit.record_block(session_id, "unknown_route", channel=str(channel or ""))
@@ -950,6 +1009,10 @@ class ProxyService:
                     "session_id": session_id,
                     "tokenized": stats,
                     "detokenized": detok_stats,
+                    # Канал и источник опознания — для владельца: видно, каким способом клиент
+                    # назвался (или что не назвался вовсе). Ни значений, ни ключей здесь нет.
+                    "channel": str(channel or ""),
+                    "channel_source": channel_source,
                 }
             )
         if streaming_requested and self._config.stream_mode == "json_only":
@@ -1068,6 +1131,13 @@ class ProxyService:
             # Признак «любой канал» читается отдельно: значение настройки видно, а не
             # выводится из отсутствия списка каналов.
             "detok_all_channels": self._config.detok_all_channels,
+            # Доверенные клиенты (решение владельца 26.09.2026): какие каналы восстанавливают
+            # значения, каким способом клиент себя объявляет и что происходит с неопознанным.
+            # Отпечатки ключей и шаблоны наружу не выводятся — только счётчики и имена каналов.
+            "trusted_clients": {
+                **self._config.trusted_clients.describe(),
+                "unknown_client": self._config.unknown_client,
+            },
             "ner_enabled": self._config.ner_enabled,
             "name_layer": (
                 self._name_layer.snapshot()
@@ -1264,9 +1334,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self._respond(400, {"error": {"code": "bad_json", "message": "request body is not JSON"}})
             return
-        channel = self.headers.get(CHANNEL_HEADER) or self.headers.get(CHANNEL_HEADER.lower())
+        headers = {str(name).lower(): str(value) for name, value in self.headers.items()}
+        channel = headers.get(CHANNEL_HEADER.lower()) or headers.get(IDENTITY_HEADER.lower())
         try:
-            result = self.service.handle_chat_completions(payload, route, path, channel)
+            result = self.service.handle_chat_completions(
+                payload, route, path, channel, headers=headers
+            )
         except RouterError as exc:
             self._respond(exc.status, {"error": {"code": exc.code, "message": exc.message}})
             return
@@ -1391,7 +1464,9 @@ def build_service(
         if incident_journal is not None
         else IncidentJournal(config.incident_log_path, audit=active_audit)
     )
-    policy = ChannelPolicy(config.detok_channels)
+    # Решение о восстановлении принимается в одном месте: список каналов и правило для
+    # неопознанного клиента живут в одной политике (M-CHANNEL-POLICY), а не в двух.
+    policy = ChannelPolicy(config.detok_channels, unknown_client=config.unknown_client)
     active_dictionary = (
         dictionary
         if dictionary is not None

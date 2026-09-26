@@ -1,8 +1,8 @@
 # FILE: src/config.py
-# VERSION: 1.3.0
+# VERSION: 1.4.0
 # START_MODULE_CONTRACT
-#   PURPOSE: Load, validate and freeze proxy configuration (routes, provider keys, token and mapping keys, policy flags, operator's own lexicon, operator's service lexicon, detokenization channels) and refuse to start on unsafe input.
-#   SCOPE: environment parsing, optional JSON config file overlay, key material loading with permission checks, loopback bind enforcement, policy defaults, detokenization channel list with the all-channels default, own-vocabulary (brand, branches, tariffs, addresses, switchboard numbers) intake, service-lexicon (tariffs, clubs, services) intake.
+#   PURPOSE: Load, validate and freeze proxy configuration (routes, provider keys, token and mapping keys, policy flags, operator's own lexicon, operator's service lexicon, detokenization channels, trusted clients) and refuse to start on unsafe input.
+#   SCOPE: environment parsing, optional JSON config file overlay, key material loading with permission checks, loopback bind enforcement, policy defaults, detokenization channel list with the all-channels default, trusted-client identification table (header, key fingerprint, User-Agent) with the unknown-client policy, own-vocabulary (brand, branches, tariffs, addresses, switchboard numbers) intake, service-lexicon (tariffs, clubs, services) intake.
 #   DEPENDS: none
 #   LINKS: M-CONFIG, V-M-CONFIG, fn-load_config, type-ProxyConfig, class-ConfigError
 #   ROLE: RUNTIME
@@ -20,10 +20,11 @@
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.3.0 - решения владельца 25.09.2026: каналы восстановления стали настройкой с умолчанием «любой канал» (пустое значение или «*»), а служебная лексика оператора (тарифы, клубы, услуги) приходит из нового раздела service_lexicon. Запрет на каналы вне контура остался отказом на старте.
-#   PREVIOUS: v1.2.0 - своя лексика оператора и необязательный файл настроек: PII_PROXY_OWN_* и PII_PROXY_CONFIG, разбор JSON и YAML с явной ошибкой при отсутствии разборщика.
-#   PREVIOUS: v1.0.1 - Phase-15 шаг 1: PII_PROXY_INCIDENT_LOG задаёт каталог журнала инцидентов (по умолчанию рядом с журналом аудита).
-#   PREVIOUS: v1.0.0 - Phase-1 M-CONFIG: first implementation of the configuration contract.
+#   LAST_CHANGE: v1.4.0 - решение владельца 26.09.2026: раздел trusted_clients (имя канала и способ опознания: заголовок, отпечаток ключа, шаблон User-Agent) и настройка unknown_client с безопасным умолчанием keep_codes. Разбор раздела живёт в M-CLIENT-IDENTITY, отказ на небезопасном значении — здесь.
+#   PREVIOUS: v1.3.0 - решения владельца 25.09.2026: каналы восстановления стали настройкой с умолчанием «любой канал» (пустое значение или «*»), а служебная лексика оператора (тарифы, клубы, услуги) приходит из нового раздела service_lexicon. Запрет на каналы вне контура остался отказом на старте.
+#   EARLIER: v1.2.0 - своя лексика оператора и необязательный файл настроек: PII_PROXY_OWN_* и PII_PROXY_CONFIG, разбор JSON и YAML с явной ошибкой при отсутствии разборщика.
+#   EARLIER: v1.0.1 - Phase-15 шаг 1: PII_PROXY_INCIDENT_LOG задаёт каталог журнала инцидентов (по умолчанию рядом с журналом аудита).
+#   EARLIER: v1.0.0 - Phase-1 M-CONFIG: first implementation of the configuration contract.
 # END_CHANGE_SUMMARY
 
 """Configuration for the PII anonymization proxy.
@@ -43,7 +44,12 @@ import stat
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from src.channel_policy import BLOCKED_CHANNELS, CHANNEL_ALL
+from src.channel_policy import BLOCKED_CHANNELS, CHANNEL_ALL, UNKNOWN_CLIENT_MODES, UNKNOWN_KEEP_CODES
+from src.client_identity import (
+    ClientIdentityError,
+    TrustedClients,
+    parse_trusted_clients,
+)
 from src.own_vocabulary import OwnVocabulary, from_env as own_from_env, from_mapping as own_from_mapping, merge as merge_own
 from src.service_lexicon import (
     ServiceLexicon,
@@ -150,6 +156,11 @@ class ProxyConfig:
     # Служебная лексика оператора (тарифы, клубы, услуги, которые система учёта оставляет в поле
     # ФИО). В коде её нет: пустое умолчание — другой клуб заполняет свои слова в примере настроек.
     service_lexicon: ServiceLexicon = field(default_factory=ServiceLexicon)
+    # Доверенные клиенты (решение владельца 26.09.2026): какие каналы восстанавливают значения и
+    # каким способом клиент себя объявляет. Пустая таблица — безопасное умолчание: опознать
+    # некого, и судьбу запроса решает настройка unknown_client.
+    trusted_clients: TrustedClients = field(default_factory=TrustedClients)
+    unknown_client: str = UNKNOWN_KEEP_CODES
 
     @property
     def detok_all_channels(self) -> bool:
@@ -431,6 +442,34 @@ def load_config(
             f"{sorted(outside)} (owner decision 15.09.2026)",
         )
 
+    # Доверенные клиенты (решение владельца 26.09.2026): у пользователя может быть несколько
+    # приложений (Cursor, Claude Code, Codex и прочие), и каждому сопоставляется имя канала.
+    # Разбор раздела живёт в M-CLIENT-IDENTITY: узнаваемые способы — заголовок, отпечаток ключа
+    # и шаблон User-Agent — описаны там, а здесь только отказ на противоречивом значении.
+    raw_trusted = (
+        overlay["trusted_clients"]
+        if "trusted_clients" in overlay
+        else source.get("PII_PROXY_TRUSTED_CLIENTS")
+    )
+    try:
+        trusted_clients = parse_trusted_clients(raw_trusted)
+    except ClientIdentityError as exc:
+        raise ConfigError(exc.code, exc.message) from exc
+    # Поведение для неизвестного клиента. Умолчание — безопасное: коды остаются кодами, потому что
+    # восстановление по недосмотру отдаёт значения туда, где их быть не должно. Значение
+    # «restore» возвращает прежнее поведение и требует явного решения оператора.
+    unknown_client = str(
+        overlay.get("unknown_client", source.get("PII_PROXY_UNKNOWN_CLIENT")) or ""
+    ).strip().lower()
+    if not unknown_client:
+        unknown_client = UNKNOWN_KEEP_CODES
+    if unknown_client not in UNKNOWN_CLIENT_MODES:
+        raise ConfigError(
+            "CONFIG_INVALID_UNKNOWN_CLIENT",
+            f"unknown client policy must be one of {sorted(UNKNOWN_CLIENT_MODES)}, "
+            f"got {unknown_client!r}",
+        )
+
     block_images = _parse_bool(
         overlay.get("block_images", source.get("PII_PROXY_BLOCK_IMAGES")) or "", True
     )
@@ -561,6 +600,8 @@ def load_config(
         ),
         ttl_days=ttl_days,
         detok_channels=detok_channels,
+        trusted_clients=trusted_clients,
+        unknown_client=unknown_client,
         block_images=block_images,
         image_policy=image_policy,
         own_vocabulary=own_vocabulary,

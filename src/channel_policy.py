@@ -1,5 +1,5 @@
 # FILE: src/channel_policy.py
-# VERSION: 1.1.0
+# VERSION: 1.2.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Decide per transport channel whether final text may be detokenized, while tool-call arguments are always restored.
 #   SCOPE: allowlist or all-channels text decision, unconditional tool-argument decision, hard ban on channels outside the perimeter.
@@ -14,14 +14,18 @@
 #   DECISION_DETOKENIZE - restore real values
 #   DECISION_KEEP - keep tokens in the text
 #   BLOCKED_CHANNELS - channels that may never be detokenized
+#   UNKNOWN_KEEP_CODES - умолчание для неопознанного клиента: коды остаются кодами
+#   UNKNOWN_RESTORE - неопознанный клиент получает прежнее решение по каналам
 #   ChannelPolicy - decision maker for text and tool arguments
 #   fn-decide_for_text - decision for a transport channel
+#   fn-decide_for_client - decision for a client that may be unidentified
 #   fn-decide_for_tool_args - decision for tool arguments
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.1.0 - решение владельца 25.09.2026: умолчание публичной сборки — восстановление в ЛЮБОМ канале (признак «*»), и список каналов стал настройкой. Запрет на каналы вне контура (внешние мессенджеры) остаётся безусловным при любом умолчании: это не удобство, а граница ответственности оператора.
-#   PREVIOUS: v1.0.0 - Phase-1 M-CHANNEL-POLICY: owner decision of 15.09.2026 (Mattermost only, Telegram never).
+#   LAST_CHANGE: v1.2.0 - решение владельца 26.09.2026: настройка «поведение для неизвестного клиента» (keep_codes по умолчанию, restore — прежнее поведение). Решение остаётся здесь, в одном месте: отдельного модуля у этой политики нет.
+#   PREVIOUS: v1.1.0 - решение владельца 25.09.2026: умолчание публичной сборки — восстановление в ЛЮБОМ канале (признак «*»), и список каналов стал настройкой. Запрет на каналы вне контура (внешние мессенджеры) остаётся безусловным при любом умолчании: это не удобство, а граница ответственности оператора.
+#   EARLIER: v1.0.0 - Phase-1 M-CHANNEL-POLICY: owner decision of 15.09.2026 (Mattermost only, Telegram never).
 # END_CHANGE_SUMMARY
 
 """Channel detokenization policy.
@@ -37,6 +41,11 @@ The hard rule survives the permissive default: channels that carry data out of
 the perimeter (external messengers) are never detokenized and cannot be
 configured as allowed. Operators who care more about privacy than convenience
 must narrow the list to their own trusted channels, as docs/PRIVACY.md says.
+
+Since 26.09.2026 the policy carries a second, independent rule for the client
+that identified itself by nothing at all (``unknown_client``): the public build
+keeps the codes in that case, because restoration that happens by accident is
+worse than a code the user can ask the agent to explain.
 """
 
 from __future__ import annotations
@@ -48,6 +57,13 @@ LOG_MARKER = "[ChannelPolicy][decide_for_text][BLOCK_DECIDE_CHANNEL]"
 
 #: Признак «восстанавливать в любом канале»: значение настройки ``detok_channels``.
 CHANNEL_ALL = "*"
+
+#: Поведение для неопознанного клиента. ``KEEP_CODES`` — умолчание публичной сборки: клиент,
+#: который ничем себя не назвал, значений не получает. ``RESTORE`` — прежнее поведение (решение
+#: по каналам), нужно тому, кто сознательно оставил восстановление для неопознанных запросов.
+UNKNOWN_KEEP_CODES = "keep_codes"
+UNKNOWN_RESTORE = "restore"
+UNKNOWN_CLIENT_MODES = frozenset({UNKNOWN_KEEP_CODES, UNKNOWN_RESTORE})
 
 DECISION_DETOKENIZE = "detokenize"
 DECISION_KEEP = "keep"
@@ -78,19 +94,26 @@ class ChannelPolicy:
     """Decide whether a channel may receive restored values.
 
     # START_CONTRACT: ChannelPolicy
-    #   PURPOSE: Hold the detokenization rule — an explicit allowlist or the all-channels marker — and answer per channel.
-    #   INPUTS: { allowed_channels: Iterable[str] - каналы, где восстановление разрешено; «*» означает любой канал }
+    #   PURPOSE: Hold the detokenization rule — an explicit allowlist or the all-channels marker — plus the rule for an unidentified client, and answer per channel and per client.
+    #   INPUTS: { allowed_channels: Iterable[str] - каналы, где восстановление разрешено; «*» означает любой канал, unknown_client: str - поведение для неопознанного клиента (keep_codes | restore) }
     #   OUTPUTS: { ChannelPolicy - ready policy }
     #   SIDE_EFFECTS: none
-    #   LINKS: M-CONFIG, M-DETOKENIZER, V-M-CHANNEL-POLICY
+    #   LINKS: M-CONFIG, M-DETOKENIZER, M-CLIENT-IDENTITY, V-M-CHANNEL-POLICY
     # END_CONTRACT: ChannelPolicy
 
     Пустой список означает «ни один канал» (fail-closed), а не «любой»: «любой» задаётся
     явным признаком ``CHANNEL_ALL``. Так значение настройки видно в healthz и в журнале, и
     его нельзя получить случайно, забыв заполнить строку.
+
+    Правило для неопознанного клиента живёт здесь же, а не в отдельной политике: решение о
+    восстановлении обязано приниматься в одном месте, иначе их станет два и они разойдутся.
     """
 
-    def __init__(self, allowed_channels: Iterable[str]) -> None:
+    def __init__(
+        self,
+        allowed_channels: Iterable[str],
+        unknown_client: str = UNKNOWN_KEEP_CODES,
+    ) -> None:
         given = {str(channel).strip().lower() for channel in allowed_channels if channel}
         blocked = given & BLOCKED_CHANNELS
         if blocked:
@@ -98,8 +121,15 @@ class ChannelPolicy:
                 "CHANNEL_POLICY_VIOLATION",
                 f"channels may never be detokenized: {sorted(blocked)}",
             )
+        mode = str(unknown_client or "").strip().lower()
+        if mode not in UNKNOWN_CLIENT_MODES:
+            raise ChannelPolicyError(
+                "CHANNEL_POLICY_VIOLATION",
+                f"unknown client policy must be one of {sorted(UNKNOWN_CLIENT_MODES)}, got {unknown_client!r}",
+            )
         self._all = CHANNEL_ALL in given
         self._allowed = given - {CHANNEL_ALL}
+        self._unknown_client = mode
 
     @property
     def allows_all_channels(self) -> bool:
@@ -110,6 +140,11 @@ class ChannelPolicy:
     def allowed_channels(self) -> frozenset[str]:
         """Return the allowlist as a frozen set (без признака «любой канал»)."""
         return frozenset(self._allowed)
+
+    @property
+    def unknown_client(self) -> str:
+        """Return what happens to a client that identified itself by nothing at all."""
+        return self._unknown_client
 
     def is_allowed(self, channel: str | None) -> bool:
         """Return True when the channel may receive restored values.
@@ -148,6 +183,30 @@ class ChannelPolicy:
         # END_CONTRACT: decide_for_text
         """
         return DECISION_DETOKENIZE if self.is_allowed(channel) else DECISION_KEEP
+
+    def decide_for_client(self, channel: str | None) -> str:
+        """Return the decision for a request whose client may not be identified at all.
+
+        # START_CONTRACT: decide_for_client
+        #   PURPOSE: Решить судьбу текста с учётом того, назвал ли клиент себя хоть чем-нибудь.
+        #   INPUTS: { channel: str | None - опознанный канал; None или пусто означает «клиент не опознан» }
+        #   OUTPUTS: { str - DECISION_DETOKENIZE or DECISION_KEEP }
+        #   SIDE_EFFECTS: none
+        #   LINKS: M-CLIENT-IDENTITY, M-DETOKENIZER, V-M-CHANNEL-POLICY
+        # END_CONTRACT: decide_for_client
+
+        Единственная точка решения о тексте: и для канала, и для клиента. Пустой канал означает не
+        «канал без имени», а «клиент не назвался ни заголовком, ни ключом, ни User-Agent, ни меткой
+        доставки». Такое восстановление не имеет права случиться по недосмотру, поэтому умолчание —
+        ``keep_codes`` (решение владельца 26.09.2026). ``restore`` возвращает прежнее поведение:
+        для неопознанного клиента судит список каналов, как до появления этой настройки.
+
+        Аргументы инструментов решаются отдельно и всегда восстанавливаются
+        (см. ``decide_for_tool_args``): контур этой настройки на них не распространяется.
+        """
+        if not str(channel or "").strip() and self._unknown_client != UNKNOWN_RESTORE:
+            return DECISION_KEEP
+        return self.decide_for_text(channel)
 
     def decide_for_tool_args(self) -> str:
         """Return the decision for tool-call arguments (always restore).

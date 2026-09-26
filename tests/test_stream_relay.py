@@ -1,5 +1,5 @@
 # FILE: tests/test_stream_relay.py
-# VERSION: 1.0.0
+# VERSION: 1.1.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Verify the streaming relay: frame splitting across chunk boundaries, channel-aware restoration of text, tool-call arguments restored before the finish frame, and fail-closed behaviour.
 #   SCOPE: iter_frames boundaries, hold buffer across deltas, trusted versus untrusted channel, tool-call accumulation, broken frame and store failure, keep-alive frames, journal records.
@@ -17,7 +17,8 @@
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.0.0 - Phase-11 шаг 3-6: поток рядом с непотоковым путём.
+#   LAST_CHANGE: v1.1.0 - решение владельца 26.09.2026: стенд канального решения обёрнут вокруг настоящей ChannelPolicy — у политики появился ответ и для неопознанного клиента, и стенд не имеет права расходиться с ней.
+#   PREVIOUS: v1.0.0 - Phase-11 шаг 3-6: поток рядом с непотоковым путём.
 # END_CHANGE_SUMMARY
 
 import json
@@ -29,7 +30,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.audit import AuditJournal  # noqa: E402
-from src.channel_policy import DECISION_DETOKENIZE, DECISION_KEEP  # noqa: E402
+from src.channel_policy import DECISION_DETOKENIZE, ChannelPolicy  # noqa: E402
 from src.detokenizer import DetokenizeError, StreamDetokenizer  # noqa: E402
 from src.stream_relay import DONE_FRAME, StreamRelay, confirmed_position, iter_frames  # noqa: E402
 from src.token_factory import SENTINEL_CLOSE, SENTINEL_OPEN  # noqa: E402
@@ -52,13 +53,21 @@ def delta_frame(content: str) -> bytes:
 
 
 class FakePolicy:
-    """Channel decision stub: Mattermost restores, anything else keeps codes."""
+    """Channel decision stub: the configured channel restores, anything else keeps codes.
+
+    Обёртка над настоящей ``ChannelPolicy``, а не своя копия правила: с 26.09.2026 политика
+    отвечает ещё и за неопознанного клиента, и стенд обязан отвечать так же — иначе проверка
+    паритета потокового и буферного путей проверяла бы сама себя.
+    """
 
     def __init__(self, trusted: str = "mattermost") -> None:
-        self._trusted = trusted
+        self._real = ChannelPolicy({trusted})
 
     def decide_for_text(self, channel: str | None) -> str:
-        return DECISION_DETOKENIZE if str(channel or "") == self._trusted else DECISION_KEEP
+        return self._real.decide_for_text(channel)
+
+    def decide_for_client(self, channel: str | None) -> str:
+        return self._real.decide_for_client(channel)
 
 
 class FakeDetokenizer:
@@ -271,7 +280,12 @@ class StreamRelayTests(unittest.TestCase):
         self.assertIn("записан", text)
 
     def test_stream_detokenizer_uses_the_same_gate(self) -> None:
-        """Проверка паритета: тот же канал — то же решение, что у буферного пути."""
+        """Проверка паритета: тот же канал — то же решение, что у буферного пути.
+
+        Решение берётся у того же метода политики, что и в буферном пути
+        (``decide_for_client``): с 26.09.2026 он отвечает ещё и за неопознанного клиента,
+        поэтому сравнение с ``decide_for_text`` проверяло бы не тот вопрос.
+        """
         detok = FakeDetokenizer()
         for channel in ("mattermost", "telegram", None):
             stream = StreamDetokenizer(
@@ -279,9 +293,15 @@ class StreamRelayTests(unittest.TestCase):
             )
             self.assertEqual(
                 stream._allowed,
-                detok._policy.decide_for_text(channel) == DECISION_DETOKENIZE,
+                detok._policy.decide_for_client(channel) == DECISION_DETOKENIZE,
                 msg=f"канал {channel!r}",
             )
+        # Неопознанный клиент (пустой канал) остаётся кодовым: это умолчание публичной сборки.
+        self.assertFalse(
+            StreamDetokenizer(
+                detok, None, "sess-1", frozenset(), boundary=confirmed_position
+            )._allowed
+        )
 
 
 if __name__ == "__main__":

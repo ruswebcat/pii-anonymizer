@@ -1,5 +1,5 @@
 # FILE: src/detokenizer.py
-# VERSION: 1.2.0
+# VERSION: 1.4.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Restore real values from tokens only where policy allows: tool-call arguments always, final text only on trusted channels.
 #   SCOPE: token scanning and replacement, channel-aware text handling, tool-call argument restoration, response walking, streaming detokenization with a hold buffer.
@@ -21,7 +21,8 @@
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.3.0 - Phase-17 (20.09.2026): доверенная граница перестала быть простым перекодировщиком. (1) Многозначный код (за ним больше одной персоны) НЕ восстанавливается и пишет инцидент: выдуманный человек хуже пустого места. (2) Соседние части ФИО (пара, тройка) обязаны подтверждаться индексом со-встречаемости — иначе значения не восстанавливаются, а инцидент записывается; причиной стало то, что коды выдаются на отдельные значения и модель может склеить имя одного человека с фамилией другого. (3) Поток удерживает хвост пары, чтобы пара не разошлась по кускам: раньше граница куска была слепым пятном заслона.
+#   LAST_CHANGE: v1.4.0 - решение владельца 26.09.2026: решение о тексте берётся у одной политики вместе с клиентом (decide_for_client): неопознанный клиент получает настройку «поведение для неизвестного клиента», а не решение по каналу. Аргументы инструментов восстанавливаются всегда, как и раньше.
+#   PREVIOUS: v1.3.0 - Phase-17 (20.09.2026): доверенная граница перестала быть простым перекодировщиком. (1) Многозначный код (за ним больше одной персоны) НЕ восстанавливается и пишет инцидент: выдуманный человек хуже пустого места. (2) Соседние части ФИО (пара, тройка) обязаны подтверждаться индексом со-встречаемости — иначе значения не восстанавливаются, а инцидент записывается; причиной стало то, что коды выдаются на отдельные значения и модель может склеить имя одного человека с фамилией другого. (3) Поток удерживает хвост пары, чтобы пара не разошлась по кускам: раньше граница куска была слепым пятном заслона.
 #   PREVIOUS: v1.2.0 - Phase-7 шаг 5: восстановление берёт наблюдённую форму по порядку вхождений, именительный падеж как запасной; тот же счётчик в потоковом пути.
 #   PREVIOUS: v1.1.0 - Phase-12 шаг 5: разрез потока считается по критерию подтверждённой позиции, который передаёт вызывающий (M-STREAM-RELAY); левый символ куска сохраняется, иначе код на стыке разбирался бы иначе, чем в непотоковом пути.
 #   PREVIOUS: v1.0.0 - Phase-1 M-DETOKENIZER: Mattermost and local files only; Telegram stays tokenized and audited.
@@ -471,7 +472,9 @@ class PayloadDetokenizer:
         if not text:
             return text, {"replaced": 0, "kept": 0, "unknown": 0, "not_in_request": 0}
         tokens = find_tokens(text)
-        if self._policy.decide_for_text(channel) != DECISION_DETOKENIZE:
+        # Решение одно на канал и на клиента: неопознанный клиент получает
+        # решение настройки «поведение для неизвестного клиента» (см. M-CHANNEL-POLICY).
+        if self._policy.decide_for_client(channel) != DECISION_DETOKENIZE:
             if tokens and self._audit is not None:
                 self._audit.append(
                     AuditEvent(
@@ -753,7 +756,7 @@ class StreamDetokenizer:
         # Порядок вхождений по коду продолжается через куски: без этого падеж выбирался
         # бы заново в каждом куске, и поток разошёлся бы с непотоковым ответом.
         self._occurrences: dict[str, int] = {}
-        self._decided = detokenizer._policy.decide_for_text(channel)
+        self._decided = detokenizer._policy.decide_for_client(channel)
         self._allowed = self._decided == DECISION_DETOKENIZE
 
     def feed(self, chunk: str) -> str:

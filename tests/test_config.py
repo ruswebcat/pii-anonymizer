@@ -1,5 +1,5 @@
 # FILE: tests/test_config.py
-# VERSION: 1.1.0
+# VERSION: 1.2.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Verify the M-CONFIG contract: valid environment yields a frozen config and every unsafe input aborts startup.
 #   SCOPE: happy path, missing provider key, key file permissions, non-loopback bind, detokenization channels (all-channels default, explicit list, marker, refusal of channels outside the perimeter), service lexicon intake, invalid route and TTL.
@@ -14,11 +14,13 @@
 #   DetokChannelsConfigTests - каналы восстановления: умолчание «любой канал» и явный список
 #   OwnVocabularyConfigTests - своя лексика организации из настроек
 #   ServiceLexiconConfigTests - служебная лексика оператора из настроек
+#   TrustedClientsConfigTests - доверенные клиенты и поведение для неизвестного клиента
 #   make_env - helper building a valid environment with temporary key files
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.1.0 - решения владельца 25.09.2026: каналы восстановления читаются из настроек с умолчанием «любой канал», появился раздел service_lexicon. Добавлены проверки обеих сторон умолчания и отказа на канале вне контура.
+#   LAST_CHANGE: v1.2.0 - решение владельца 26.09.2026: раздел trusted_clients (три способа опознания) и настройка unknown_client с безопасным умолчанием; проверены обе стороны настройки и отказ на противоречивой таблице.
+#   PREVIOUS: v1.1.0 - решения владельца 25.09.2026: каналы восстановления читаются из настроек с умолчанием «любой канал», появился раздел service_lexicon. Добавлены проверки обеих сторон умолчания и отказа на канале вне контура.
 #   PREVIOUS: v1.0.0 - Phase-1 M-CONFIG verification.
 # END_CHANGE_SUMMARY
 
@@ -31,6 +33,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.channel_policy import UNKNOWN_KEEP_CODES, UNKNOWN_RESTORE  # noqa: E402
+from src.client_identity import fingerprint  # noqa: E402
 from src.config import ConfigError, ProxyConfig, load_config  # noqa: E402
 
 
@@ -350,6 +354,104 @@ class ServiceLexiconConfigTests(unittest.TestCase):
         self.assertEqual(2, cfg.service_lexicon.category_count)
         self.assertEqual(3, cfg.service_lexicon.word_count)
         self.assertIn("базовый", cfg.service_lexicon.by_category["тарифы и клубы"])
+
+
+class TrustedClientsConfigTests(unittest.TestCase):
+    """Доверенные клиенты и поведение для неизвестного клиента приходят из настроек."""
+
+    def test_absent_section_leaves_the_table_empty_and_the_safe_mode(self) -> None:
+        """Умолчание публичной сборки: опознавать некого, неопознанный клиент получает коды."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_config(make_env(tmpdir))
+        self.assertEqual(0, len(cfg.trusted_clients))
+        self.assertEqual(UNKNOWN_KEEP_CODES, cfg.unknown_client)
+
+    def test_the_compact_environment_value_is_understood(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_config(
+                make_env(
+                    tmpdir,
+                    PII_PROXY_TRUSTED_CLIENTS="desk=header:desk;laptop=ua:Laptop/*;desk=ua:Desk/*",
+                )
+            )
+        self.assertEqual(("desk", "laptop"), cfg.trusted_clients.channels)
+        self.assertEqual({"header": 1, "key": 0, "user_agent": 2}, cfg.trusted_clients.methods)
+
+    def test_a_json_environment_value_is_understood(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = load_config(
+                make_env(
+                    tmpdir,
+                    PII_PROXY_TRUSTED_CLIENTS=json.dumps(
+                        [{"channel": "desk", "key_sha256": fingerprint("desk-stub-key")}]
+                    ),
+                )
+            )
+        self.assertEqual(("desk",), cfg.trusted_clients.channels)
+
+    def test_the_overlay_section_is_read_as_a_list_of_records(self) -> None:
+        """Основной способ настройки: перечень записей рядом с пояснением оператора."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            overlay = os.path.join(tmpdir, "config.json")
+            with open(overlay, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "trusted_clients": [
+                            {"channel": "cursor", "header_value": "cursor", "comment": "IDE"},
+                            {
+                                "channel": "codex",
+                                "key_sha256": fingerprint("codex-stub-key"),
+                                "user_agent": "*codex*",
+                            },
+                        ],
+                        "unknown_client": UNKNOWN_RESTORE,
+                    },
+                    handle,
+                )
+            cfg = load_config(make_env(tmpdir), config_path=overlay)
+        self.assertEqual(("codex", "cursor"), cfg.trusted_clients.channels)
+        self.assertEqual(UNKNOWN_RESTORE, cfg.unknown_client)
+        # Список каналов файл не задавал: умолчание осталось прежним.
+        self.assertTrue(cfg.detok_all_channels)
+
+    def test_a_channel_outside_the_perimeter_is_refused_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(
+                    make_env(
+                        tmpdir,
+                        PII_PROXY_TRUSTED_CLIENTS="telegram=ua:Telegram/*",
+                    )
+                )
+        self.assertEqual("CLIENT_IDENTITY_BLOCKED_CHANNEL", ctx.exception.code)
+
+    def test_a_broken_fingerprint_is_refused_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(
+                    make_env(tmpdir, PII_PROXY_TRUSTED_CLIENTS="desk=key:not-a-fingerprint")
+                )
+        self.assertEqual("CLIENT_IDENTITY_BAD_FINGERPRINT", ctx.exception.code)
+
+    def test_one_key_cannot_belong_to_two_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(
+                    make_env(
+                        tmpdir,
+                        PII_PROXY_TRUSTED_CLIENTS=(
+                            f"desk=key:{fingerprint('shared-stub-key')};"
+                            f"laptop=key:{fingerprint('shared-stub-key')}"
+                        ),
+                    )
+                )
+        self.assertEqual("CLIENT_IDENTITY_DUPLICATE_KEY", ctx.exception.code)
+
+    def test_an_unknown_client_mode_is_refused_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(make_env(tmpdir, PII_PROXY_UNKNOWN_CLIENT="maybe"))
+        self.assertEqual("CONFIG_INVALID_UNKNOWN_CLIENT", ctx.exception.code)
 
 
 if __name__ == "__main__":

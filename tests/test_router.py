@@ -1,8 +1,8 @@
 # FILE: tests/test_router.py
-# VERSION: 1.1.0
+# VERSION: 1.2.0
 # START_MODULE_CONTRACT
-#   PURPOSE: Verify the M-ROUTER contract: pipeline order, fail-closed blocks, channel handling (all-channels default and a narrowed list), healthz output and a real HTTP round trip.
-#   SCOPE: happy path, telegram token retention, all-channels default, narrowed list, image blocking, unknown route, store failure, healthz, live socket round trip, деградация остатка вместо отказа (Вариант 1).
+#   PURPOSE: Verify the M-ROUTER contract: pipeline order, fail-closed blocks, channel handling (all-channels default, narrowed list, unidentified client under both unknown-client policies), healthz output and a real HTTP round trip.
+#   SCOPE: happy path, telegram token retention, all-channels default, narrowed list, unidentified client (keep_codes by default, restore on request), image blocking, unknown route, store failure, healthz, live socket round trip, деградация остатка вместо отказа (Вариант 1).
 #   DEPENDS: M-ROUTER, M-TEST-HARNESS
 #   LINKS: V-M-ROUTER, VF-001, VF-004
 #   ROLE: TEST
@@ -17,7 +17,8 @@
 # END_MODULE_MAP
 #
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v1.1.0 - решение владельца 25.09.2026: умолчание публичной сборки — восстановление в любом канале. Проверки держат обе стороны: без метки значения возвращаются при умолчании и не возвращаются на суженном списке.
+#   LAST_CHANGE: v1.2.0 - решение владельца 26.09.2026: неопознанный клиент (ни заголовка, ни ключа, ни User-Agent, ни метки доставки) получает коды, а «restore» возвращает прежнее поведение отдельной проверкой.
+#   PREVIOUS: v1.1.0 - решение владельца 25.09.2026: умолчание публичной сборки — восстановление в любом канале. Проверки держат обе стороны: без метки значения возвращаются при умолчании и не возвращаются на суженном списке.
 #   PREVIOUS: v1.0.2 - дефект-фикс 19.09.2026: живой шаблон отказа (значение несколько раз в строке) даёт ответ, а не replacement_failed; отказ заслона — 422 вместо 403; канал берётся из объявления происхождения сообщения, расхождение решается в сторону запрета восстановления.
 #   EARLIER: v1.0.0 - Phase-1 M-ROUTER verification.
 # END_CHANGE_SUMMARY
@@ -45,6 +46,7 @@ from src.router import (  # noqa: E402
     build_service,
     make_handler,
 )
+from src.client_identity import CLIENT_KEY_HEADER, IDENTITY_HEADER, fingerprint  # noqa: E402
 from src.normalize import normalize  # noqa: E402
 from src.token_factory import find_tokens, make_token  # noqa: E402
 from tests import harness  # noqa: E402
@@ -193,12 +195,34 @@ class RouterTests(unittest.TestCase):
         self.assertIn(self.token, content)
         self.assertNotIn(FIO, content)
 
-    def test_missing_marker_restores_under_the_all_channels_default(self) -> None:
-        """Умолчание публичной сборки — любой канал: без метки и без заголовка значения возвращаются."""
+    def test_unidentified_client_keeps_codes_by_default(self) -> None:
+        """Неопознанный клиент получает коды: ни заголовка, ни ключа, ни метки, ни User-Agent.
+
+        Решение владельца 26.09.2026: клиент, который себя никак не назвал, значений не получает.
+        Восстановление по недосмотру отдаёт персональные данные туда, где их быть не должно, а
+        код пользователь всегда может попросить агента расшифровать.
+        """
         self.upstream.response = {
             "choices": [{"message": {"role": "assistant", "content": f"клиент {self.token}"}}]
         }
         _, body = self.service.handle_chat_completions(payload_with_pii(), "ds", CHAT_PATH, None)
+        content = body["choices"][0]["message"]["content"]
+        self.assertIn(self.token, content)
+        self.assertNotIn(FIO, content)
+        # Аргументы инструментов восстанавливаются всегда: исполняет их агент внутри контура.
+        self.assertEqual(body["pii_proxy"]["channel"], "")
+        self.assertEqual(body["pii_proxy"]["channel_source"], "none")
+
+    def test_unidentified_client_restores_when_the_operator_allows_it(self) -> None:
+        """unknown_client=restore возвращает прежнее поведение публичной сборки."""
+        self.upstream.response = {
+            "choices": [{"message": {"role": "assistant", "content": f"клиент {self.token}"}}]
+        }
+        permissive = harness.temp_config(self._tmp.name, PII_PROXY_UNKNOWN_CLIENT="restore")
+        service = build_service(
+            permissive, store=self.store, upstream=self.upstream, audit=self.audit
+        )
+        _, body = service.handle_chat_completions(payload_with_pii(), "ds", CHAT_PATH, None)
         self.assertEqual(body["choices"][0]["message"]["content"], f"клиент {FIO}")
 
     def test_missing_marker_keeps_tokens_when_the_list_is_narrowed(self) -> None:
@@ -608,6 +632,86 @@ class RouterTests(unittest.TestCase):
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as response:
                 health = json.loads(response.read().decode("utf-8"))
             self.assertEqual(health["status"], "ok")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_header_names_the_channel_for_a_third_party_client(self) -> None:
+        """Заголовок X-PII-Channel доходит до службы через настоящий обработчик запросов.
+
+        Сторонняя IDE ставит свой заголовок и не шлёт меток Hermes: без этой проверки
+        опознание клиента осталось бы проверенным только на прямом вызове службы.
+        """
+        self.upstream.response = {
+            "choices": [{"message": {"role": "assistant", "content": f"клиент {self.token}"}}]
+        }
+        probe = harness.temp_config(
+            self._tmp.name, PII_PROXY_TRUSTED_CLIENTS="desk=header:desk"
+        )
+        service = build_service(
+            probe, store=self.store, upstream=self.upstream, audit=self.audit
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/ds{CHAT_PATH}",
+                data=json.dumps(payload_with_pii()).encode("utf-8"),
+                headers={"Content-Type": "application/json", IDENTITY_HEADER: "desk"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(f"клиент {FIO}", body["choices"][0]["message"]["content"])
+            self.assertEqual("desk", body["pii_proxy"]["channel"])
+            self.assertEqual("header", body["pii_proxy"]["channel_source"])
+
+            # Тот же вопрос без заголовка — от неопознанного клиента: значения не отдаются.
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/ds{CHAT_PATH}",
+                data=json.dumps(payload_with_pii()).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            self.assertIn(self.token, body["choices"][0]["message"]["content"])
+            self.assertEqual("none", body["pii_proxy"]["channel_source"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_access_key_identifies_the_client(self) -> None:
+        """Заголовок с ключом доступа опознаёт клиента по отпечатку: ключа в настройках нет."""
+        self.upstream.response = {
+            "choices": [{"message": {"role": "assistant", "content": f"клиент {self.token}"}}]
+        }
+        probe = harness.temp_config(
+            self._tmp.name,
+            PII_PROXY_TRUSTED_CLIENTS=f"desk=key:{fingerprint('desk-stub-key')}",
+        )
+        service = build_service(
+            probe, store=self.store, upstream=self.upstream, audit=self.audit
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/ds{CHAT_PATH}",
+                data=json.dumps(payload_with_pii()).encode("utf-8"),
+                headers={"Content-Type": "application/json", CLIENT_KEY_HEADER: "desk-stub-key"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(f"клиент {FIO}", body["choices"][0]["message"]["content"])
+            self.assertEqual("key", body["pii_proxy"]["channel_source"])
         finally:
             server.shutdown()
             server.server_close()
